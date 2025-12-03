@@ -1,0 +1,4 @@
+<Solution>
+  <Project Path="CaseApp.Test/CaseApp.Test.csproj" Id="9b5f470f-7009-40f5-9199-3e7a56d9c718" />
+  <Project Path="CaseApp/CaseApp.csproj" />
+</Solution>
