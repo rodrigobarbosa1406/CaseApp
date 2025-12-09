@@ -1,0 +1,21 @@
+﻿apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: caseapp-deployment
+  labels:
+    app: caseapp
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: caseapp
+  template:
+    metadata:
+      labels:
+        app: caseapp
+    spec:
+      containers:
+      - name: caseapp
+        image: rbarbosa1406/caseapp:1.0.0
+        ports:
+        - containerPort: 8080
