@@ -1,0 +1,322 @@
+﻿trigger: none
+
+pool:
+  name: Default
+
+variables:
+- group: CaseApp-Secrets
+
+- name: dockerRegistryServiceConnection
+  value: 'dockerhub'
+- name: imageRepository
+  value: 'rbarbosa1406/caseapp'
+- name: imageTagMajorVersion
+  value: 1
+- name: imageTagMinorVersion
+  value: 0
+- name: imageTagPatchVersion
+  value: 0
+- name: imageTagVersion
+  value: '$(imageTagMajorVersion).$(imageTagMinorVersion).$(imageTagPatchVersion)'
+- name: azureServiceConnection
+  value: 'azure-aks-connection'
+- name: aksResourceGroup
+  value: 'rg-caseapp-demo'
+- name: aksClusterName
+  value: 'aks-caseapp-demo'
+
+stages:
+- stage: Build_Test
+  displayName: Build da aplicação e testes unitários
+  jobs:
+  - job: Build
+    steps:
+    - checkout: self
+
+    - script: dotnet restore CaseApp.slnx
+      displayName: 'Restore'
+
+    - script: dotnet build CaseApp.slnx --configuration Release --no-restore
+      displayName: 'Build'
+
+    - script: dotnet test CaseApp.Test/CaseApp.Test.csproj --configuration Release --no-build --logger "trx;LogFileName=testresults.trx"
+      displayName: 'Testes unitários'
+
+    - task: PublishTestResults@2
+      displayName: 'Publicar resultados de teste'
+      inputs:
+        testResultsFormat: 'VSTest'
+        testResultsFiles: '**/testresults.trx'
+        failTaskOnFailedTests: true
+
+    - script: dotnet test CaseApp.Test/CaseApp.Test.csproj --configuration Release --no-build --collect "XPlat Code Coverage"
+      displayName: 'Testes unitários com cobertura'
+
+    - task: PublishCodeCoverageResults@2
+      displayName: 'Publicar resultados de cobertura de código'
+      inputs:
+        codeCoverageTool: 'Cobertura'
+        summaryFileLocation: '$(System.DefaultWorkingDirectory)/**/coverage.cobertura.xml'
+
+- stage: SonarQubeTest_SAST
+  displayName: Análise estática de código (SAST) com SonarQube
+  dependsOn: Build_Test
+  condition: succeeded()
+  jobs:
+  - job: RunSonarQube
+    steps:
+    - checkout: self
+
+    - task: SonarQubePrepare@8
+      inputs:
+        SonarQube: 'SonarQubeServiceConnection'
+        scannerMode: 'CLI'
+        configMode: 'manual'
+        cliProjectKey: 'CaseApp'
+        cliProjectName: 'CaseApp'
+        cliSources: '.'
+        extraProperties: |
+          sonar.cs.opencover.reportPaths=$(System.DefaultWorkingDirectory)/**/coverage.cobertura.xml
+
+    - task: SonarQubeAnalyze@8
+      displayName: 'Run SonarQube Analysis'
+
+    - task: SonarQubePublish@8
+      inputs:
+        pollingTimeoutSec: '300'
+
+- stage: Docker
+  displayName: Build e Push Docker
+  dependsOn: SonarQubeTest_SAST
+  condition: succeeded()
+  jobs:
+  - job: DockerBuild
+    steps:
+    - checkout: self
+
+    - task: Docker@2
+      displayName: 'Build imagem Docker'
+      inputs:
+        command: buildAndPush
+        repository: $(imageRepository)
+        dockerfile: CaseApp/Dockerfile
+        containerRegistry: $(dockerRegistryServiceConnection)
+        tags: |
+          $(imageTagVersion)
+
+- stage: Trivy_SCA
+  displayName: Scan de segurança (SCA) com Trivy
+  dependsOn: Docker
+  condition: succeeded()
+  jobs:
+  - job: RunTrivy
+    pool:
+      name: Default
+    steps:
+    - checkout: self
+
+    - script: |
+        curl -X POST http://trivy-server:4954/v1/fs \
+          -H "Content-Type: application/json" \
+          -d '{
+                "path": "/src",
+                "severity": ["HIGH","CRITICAL"],
+                "format": "sarif"
+              }' \
+          -o $(Build.SourcesDirectory)/trivy-fs-report.sarif
+      displayName: 'Trivy File System Scan (API)'
+
+    - script: |
+        curl -X POST http://trivy-server:4954/v1/image \
+          -H "Content-Type: application/json" \
+          -d '{
+                "image": "rbarbosa1406/caseapp:$(imageTagVersion)",
+                "severity": ["HIGH","CRITICAL"],
+                "format": "sarif"
+              }' \
+          -o $(Build.SourcesDirectory)/trivy-image-report.sarif
+      displayName: 'Trivy Image Scan (API)'
+
+    - script: |
+        curl -X POST http://trivy-server:4954/v1/config \
+          -H "Content-Type: application/json" \
+          -d '{
+                "file": "/src/CaseApp/caseapp-deployment.yml",
+                "severity": ["HIGH","CRITICAL"],
+                "format": "sarif"
+              }' \
+          -o $(Build.SourcesDirectory)/trivy-config-report.sarif
+      displayName: 'Trivy Config Scan (API)'
+
+    - task: PublishBuildArtifacts@1
+      displayName: 'Publish Trivy Reports'
+      inputs:
+        PathtoPublish: '$(Build.SourcesDirectory)'
+        ArtifactName: 'CodeAnalysisLogs'
+        publishLocation: 'Container'
+
+- stage: Deploy_Hml
+  displayName: Deploy no AKS no namespace hml
+  dependsOn: Trivy_SCA
+  condition: succeeded()
+  jobs:
+  - job: DeployAKSHml
+    steps:
+    - checkout: self
+    - task: AzureCLI@2
+      displayName: 'Login no AKS e aplicar manifests'
+      inputs:
+        azureSubscription: $(azureServiceConnection)
+        scriptType: bash
+        scriptLocation: inlineScript
+        inlineScript: |
+          az aks get-credentials --resource-group $(aksResourceGroup) --name $(aksClusterName) --overwrite-existing
+          export IMAGE_TAG_VERSION=$(imageTagVersion)
+          envsubst < CaseApp/caseapp-deployment.yml | kubectl apply -n hml -f -
+          kubectl apply -f CaseApp/caseapp-service.yml -n hml
+
+- stage: Integration_Tests
+  displayName: Testes de Integração com Postman
+  dependsOn: Deploy_Hml
+  condition: succeeded()
+  jobs:
+  - job: RunPostmanTests
+    steps:
+    - checkout: self
+
+    - task: AzureCLI@2
+      name: GetServiceIP
+      displayName: 'Obter IP do serviço no AKS'
+      inputs:
+        azureSubscription: $(azureServiceConnection)
+        scriptType: bash
+        scriptLocation: inlineScript
+        inlineScript: |
+          az aks get-credentials --resource-group $(aksResourceGroup) --name $(aksClusterName) --overwrite-existing
+
+          # Obter IP do service (aguarda se ainda não estiver pronto)
+          for i in {1..20}; do
+            SERVICE_IP=$(kubectl get svc caseapp-service -n hml -o jsonpath='{.status.loadBalancer.ingress[0].ip}' || true)
+            if [ -n "${SERVICE_IP:-}" ]; then break; fi
+            echo "Aguardando IP do LoadBalancer..."
+            sleep 10
+          done
+          if [ -z "${SERVICE_IP:-}" ]; then
+            echo "Falha ao obter IP do serviço"
+            exit 1
+          fi
+          echo "##vso[task.setvariable variable=SERVICE_IP]$SERVICE_IP"
+
+    - script: |
+        newman run Postman/CaseApp.postman_collection.json \
+          -e Postman/CaseApp.Demo.postman_environment.json \
+          --env-var base-url=http://$(SERVICE_IP)/api/v1 \
+          --env-var client-id=$CLIENT_ID \
+          --env-var client-secret=$CLIENT_SECRET \
+          --env-var username=$USERNAME \
+          --env-var password=$PASSWORD \
+          --reporters cli,junit \
+          --reporter-junit-export newman-report.xml
+
+      displayName: 'Executar Postman Collections'
+      env:
+        CLIENT_ID: $(CLIENT_ID)
+        CLIENT_SECRET: $(CLIENT_SECRET)
+        USERNAME: $(USERNAME)
+        PASSWORD: $(PASSWORD)
+
+    - task: PublishTestResults@2
+      displayName: 'Publicar resultados dos testes Postman'
+      inputs:
+        testResultsFormat: 'JUnit'
+        testResultsFiles: '$(System.DefaultWorkingDirectory)/newman-report.xml'
+        failTaskOnFailedTests: true
+
+- stage: OWASP_ZAP_DAST
+  displayName: Testes dinâmicos de segurança (DAST) com OWASP ZAP
+  dependsOn: Integration_Tests
+  condition: succeeded()
+#  variables:
+#    SERVICE_IP: $[ stageDependencies.Integration_Tests.RunPostmanTests.outputs['GetServiceIP.SERVICE_IP'] ]
+  jobs:
+  - job: RunZAP
+    steps:
+    - checkout: self
+
+    - task: AzureCLI@2
+      name: GetServiceIP
+      displayName: 'Obter IP do serviço no AKS'
+      inputs:
+        azureSubscription: $(azureServiceConnection)
+        scriptType: bash
+        scriptLocation: inlineScript
+        inlineScript: |
+          az aks get-credentials --resource-group $(aksResourceGroup) --name $(aksClusterName) --overwrite-existing
+
+          # Obter IP do service (aguarda se ainda não estiver pronto)
+          for i in {1..20}; do
+            SERVICE_IP=$(kubectl get svc caseapp-service -n hml -o jsonpath='{.status.loadBalancer.ingress[0].ip}' || true)
+            if [ -n "${SERVICE_IP:-}" ]; then break; fi
+            echo "Aguardando IP do LoadBalancer..."
+            sleep 10
+          done
+          if [ -z "${SERVICE_IP:-}" ]; then
+            echo "Falha ao obter IP do serviço"
+            exit 1
+          fi
+          echo "##vso[task.setvariable variable=SERVICE_IP]$SERVICE_IP"
+
+    - script: |
+        TARGET_URL="http://$(SERVICE_IP)"
+        
+        echo "Iniciando spider em $TARGET_URL"
+        SPIDER_ID=$(curl -s "http://owasp-zap:8080/JSON/spider/action/scan/?url=$TARGET_URL" | jq -r .scan)
+        
+        sleep 30
+        
+        URLS_FOUND=$(curl -s "http://owasp-zap:8080/JSON/spider/view/results/?scanId=$SPIDER_ID" | jq '.results | length')
+        
+        if [ "$URLS_FOUND" -eq 0 ]; then
+          echo "Nenhuma URL encontrada pelo spider"
+          exit 1
+        fi
+        
+        echo "$URLS_FOUND URLs encontradas"
+        
+        echo "Iniciando active scan"
+        curl -s "http://owasp-zap:8080/JSON/ascan/action/scan/?url=$TARGET_URL"
+        
+        sleep 120
+        
+        mkdir -p $(Build.SourcesDirectory)/dast
+        curl -s "http://owasp-zap:8080/OTHER/core/other/htmlreport/" -o $(Build.SourcesDirectory)/dast/zap-report.html
+      displayName: 'Executar DAST com OWASP ZAP'
+
+    - task: PublishPipelineArtifact@1
+      inputs:
+        targetPath: '$(Build.SourcesDirectory)/dast'
+        artifact: 'dast-report-$(Build.BuildId)-attempt-$(System.StageAttempt)'
+
+- stage: Deploy_Prod
+  displayName: Deploy no AKS no namespace de prod
+  dependsOn: OWASP_ZAP_DAST
+  condition: succeeded()
+  jobs:
+  - deployment: DeployAKSProd
+    environment: 'prod'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - checkout: self
+          - task: AzureCLI@2
+            displayName: 'Login no AKS e aplicar manifests'
+            inputs:
+              azureSubscription: $(azureServiceConnection)
+              scriptType: bash
+              scriptLocation: inlineScript
+              inlineScript: |
+                az aks get-credentials --resource-group $(aksResourceGroup) --name $(aksClusterName) --overwrite-existing
+                export IMAGE_TAG_VERSION=$(imageTagVersion)
+                envsubst < CaseApp/caseapp-deployment.yml | kubectl apply -n prod -f -
+                kubectl apply -f CaseApp/caseapp-service.yml -n prod
