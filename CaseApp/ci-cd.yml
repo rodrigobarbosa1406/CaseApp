@@ -206,6 +206,7 @@ stages:
             exit 1
           fi
           echo "##vso[task.setvariable variable=SERVICE_IP]$SERVICE_IP"
+          echo "##vso[task.setvariable variable=SERVICE_IP;isOutput=true]$SERVICE_IP"
 
     - script: |
         newman run Postman/CaseApp.postman_collection.json \
@@ -236,35 +237,12 @@ stages:
   displayName: Testes dinâmicos de segurança (DAST) com OWASP ZAP
   dependsOn: Integration_Tests
   condition: succeeded()
-#  variables:
-#    SERVICE_IP: $[ stageDependencies.Integration_Tests.RunPostmanTests.outputs['GetServiceIP.SERVICE_IP'] ]
+  variables:
+    SERVICE_IP: $[ stageDependencies.Integration_Tests.RunPostmanTests.outputs['GetServiceIP.SERVICE_IP'] ]
   jobs:
   - job: RunZAP
     steps:
     - checkout: self
-
-    - task: AzureCLI@2
-      name: GetServiceIP
-      displayName: 'Obter IP do serviço no AKS'
-      inputs:
-        azureSubscription: $(azureServiceConnection)
-        scriptType: bash
-        scriptLocation: inlineScript
-        inlineScript: |
-          az aks get-credentials --resource-group $(aksResourceGroup) --name $(aksClusterName) --overwrite-existing
-
-          # Obter IP do service (aguarda se ainda não estiver pronto)
-          for i in {1..20}; do
-            SERVICE_IP=$(kubectl get svc caseapp-service -n hml -o jsonpath='{.status.loadBalancer.ingress[0].ip}' || true)
-            if [ -n "${SERVICE_IP:-}" ]; then break; fi
-            echo "Aguardando IP do LoadBalancer..."
-            sleep 10
-          done
-          if [ -z "${SERVICE_IP:-}" ]; then
-            echo "Falha ao obter IP do serviço"
-            exit 1
-          fi
-          echo "##vso[task.setvariable variable=SERVICE_IP]$SERVICE_IP"
 
     - script: |
         TARGET_URL="http://$(SERVICE_IP)"
